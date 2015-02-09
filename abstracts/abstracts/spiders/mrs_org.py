@@ -5,6 +5,7 @@ from scrapy import log
 from scrapy.contrib.spiders import CrawlSpider, Rule
 from scrapy.contrib.linkextractors import LinkExtractor
 from w3lib.html import remove_tags
+from html2text import HTML2Text
 
 from abstracts.items import AbstractItem
 
@@ -63,22 +64,36 @@ class MrsOrgSpider(CrawlSpider):
         ),
     )
 
+    def __init__(self, *args, **kwargs):
+        super(MrsOrgSpider, self).__init__(*args, **kwargs)
+        self.html2text = HTML2Text()
+        self.html2text.body_width = 0
+        self.html2text.ignore_images = True
+
     def parse_abstracts_old(self, response):
         sel = scrapy.Selector(response)
-        title = self._get_title(sel)
+        # Extract symposium name
+        symposium_name, = sel.css('h1::text').extract()[:1] or ['']
+        symposium_name = re.sub('.+?:', '', symposium_name, count=1)
+        symposium_name = symposium_name.strip()
+        # Extract malformed content column
         column = '\n'.join(sel.css('div#contentCol').extract())
         # Remove newline chars that are make no sense in HTML (only <br> do)
-        flat_text = re.sub(r'[\n\r]+', '', column, flags=re.M)
-        # Remove tags
-        flat_text = remove_tags(flat_text, keep=('br'))
-        # Convert <br> to LF
-        flat_text = re.sub('<br\s*/?>', '\n', flat_text)
-        # Each abstract starts with hour and abstract no.
-        section_re = r'(?:\d+:\d+ [AP]M )?\s*[\*A-Z/]+\d+\.\d+?.*'
-        # Split it. The separator is hour with abstract number
-        # Also skip first element, because this is introduction
+        flat_text = re.sub(r'[\n\r]+', '', column, flags=re.MULTILINE)
+        # Convert HTML to Markdown
+        flat_text = self.html2text.handle(flat_text)
+        # Each abstract starts with hour and abstract no, so we split by it
+        section_re = r'''
+            \** # Bold text 
+            (?:\d+:\d+\ *[AP]M\ *)? # Optional hour
+            [_\*\s]* # Bold, italics
+            [\*A-Z/]+\d+\.\d+ # Abstract number
+            [_\*\s]*.* # End bold, italics
+        '''
+        # Skip first element, because this is introduction
         # that we don't need
-        contents = re.split(section_re, flat_text, flags=re.M)[1:]
+        contents = re.split(section_re, flat_text,
+                            flags=re.MULTILINE | re.VERBOSE)[1:]
         # Skip page if no abstracts were found
         if not contents:
             self.log('No abstracts found on: %s' % response.url,
@@ -93,32 +108,43 @@ class MrsOrgSpider(CrawlSpider):
             content = re.sub('(?:## )?SESSION.+', '', content,
                              flags=re.M | re.S)
 
-            # Remove first line of abstract (author list)
+            # Extract only non-empty lines
             non_empty_lines = filter(lambda x: x.strip() != '',
                                      content.split('\n'))
+            if not non_empty_lines:
+                continue
+            title, = re.findall('\*\*(.+?)\*\*',
+                                non_empty_lines[0])[:1] or ['']
+            title = title.strip()
             content = '\n'.join(non_empty_lines[1:])
             # Remove "Back To Top" string
             content = content.replace('Back To Top', '')
             content = content.strip()
 
-            yield AbstractItem(url=response.url, title=title, content=content)
+            yield AbstractItem(url=response.url, title=title, content=content,
+                               symposium_name=symposium_name)
 
     def parse_abstracts_new(self, response):
         sel = scrapy.Selector(response)
-        title = self._get_title(sel)
-        contents = sel.css(
+        symposium_name, = sel.css('h1::text').extract()[:1] or ['']
+        symposium_name = re.sub('.+?:', '', symposium_name, count=1)
+        symposium_name = symposium_name.strip()
+        content_els = sel.css(
             'a:contains("Hide Abstract") + div.expandIt, '
             'a:contains("Show Abstract") + div.expandIt'
-        ).extract()
+        )
         # Skip page if no abstracts found
-        if not contents:
+        if not content_els:
             self.log('no abstracts found on: %s' % response.url,
                      level=log.WARNING)
             return
-        for content in contents:
+        for el in content_els:
+            title, = el.xpath(
+                './preceding-sibling::h2[1]/following-sibling::p[1]/text()'
+            ).extract()[:1] or ['']
+            content = el.extract()
             content = remove_tags(content)
-            yield AbstractItem(url=response.url, title=title, content=content)
-
-    def _get_title(self, sel):
-        title, = sel.css('title::text').extract()[:1] or ['']
-        return title.strip()
+            if 'Abstract not available' in content:
+                continue
+            yield AbstractItem(url=response.url, title=title, content=content,
+                               symposium_name=symposium_name)
